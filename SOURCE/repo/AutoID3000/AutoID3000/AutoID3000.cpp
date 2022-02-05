@@ -25,20 +25,21 @@ using namespace std;
 
 namespace fs = filesystem;
 
-auto timerstart = chrono::high_resolution_clock::now();
-
 #define EXPORTFUNCTION extern "C" __declspec(dllexport)
 
-auto modversion = int(3001);
+auto modversion = int(3002);
 EXPORTFUNCTION auto modVersion() {
 	return modversion;
 }
 auto modname = string("AutoID3000");
 auto modMessage(string messagetext, int messageflags = MB_OK) {
-	return MessageBox(NULL, messagetext.c_str(), modname.c_str(), messageflags);
+	return MessageBox(GetActiveWindow(), messagetext.c_str(), modname.c_str(), messageflags);
 }
 
+auto locationdata = fs::path("data");
+
 auto folderroot = fs::path(GAME_PATH(""));
+auto folderdata = folderroot / locationdata;
 auto folderscripts = folderroot / fs::path("scripts");
 auto folderml = folderroot / fs::path("modloader");
 auto foldermod = folderroot / fs::path(modname);
@@ -77,7 +78,7 @@ class LoadedModule {
 public:
 	fs::path modulepath;
 	bool isinstalled = false;
-	LoadedModule(fs::path modulestem, fs::path mlfolder) {
+	LoadedModule(fs::path modulestem, fs::path mlfolder = "") {
 		auto modulename = modulestem.replace_extension(".asi");
 		if (fs::exists(folderroot / modulename)) {
 			modulepath = folderroot;
@@ -87,7 +88,10 @@ public:
 			modulepath = folderscripts;
 			isinstalled = true;
 		}
-		else if (fs::exists(folderml / mlfolder / modulename)) {
+		else if (
+			mlfolder.string().length() > 0
+			&& fs::exists(folderml / mlfolder / modulename)
+			) {
 			modulepath = folderml / mlfolder;
 			isinstalled = true;
 		}
@@ -97,7 +101,7 @@ public:
 #define MODULEFLA string("fastman92 Limit Adjuster")
 #define MODULEOLA string("Open Limit Adjuster")
 
-auto loadedml = LoadedModule("modloader", "");
+auto loadedml = LoadedModule("modloader");
 auto loadedfla = LoadedModule("$fastman92limitAdjuster", MODULEFLA);
 auto loadedola = LoadedModule("III.VC.SA.LimitAdjuster.", MODULEOLA);
 
@@ -140,7 +144,28 @@ auto casePath(fs::path path) {
 	return pathreturn;
 }
 
-auto copyWait(fs::path sourcepath, fs::path targetpath) {
+auto hashFile(fs::path filelocation) {
+	auto filepath = fs::path(filelocation);
+	auto filehash = int(0);
+	auto filehandle = fstream();
+	filehandle.open(filepath, fstream::in | fstream::binary);
+	if (filehandle.is_open()) {
+		auto filesize = fs::file_size(filepath);
+		auto filebuffer = vector<char>(filesize);
+		if (filehandle.read(filebuffer.data(), filesize)) {
+			filehash = CRC::Calculate(filebuffer.data(), filebuffer.size(), CRC::CRC_32());
+		}
+		filehandle.close();
+	}
+	return filehash;
+}
+
+auto copyWait(fs::path sourcepath, fs::path targetpath, bool showmessage = false) {
+	if (hashFile(sourcepath) == hashFile(targetpath)) {
+		if (showmessage) modMessage("Both files are identical.");
+		return;
+	}
+
 	targetpath = casePath(targetpath);
 	fs::create_directories(targetpath.parent_path());
 	auto temporarypath = targetpath;
@@ -171,7 +196,7 @@ auto OutputPath(fs::path filepath) {
 		if (pathfind == string::npos) break;
 		pathstring.erase(pathfind, outputlength);
 	}
-	return pathstring;
+	return (fs::path(".") / fs::path(pathstring)).string();
 }
 
 auto storagebackups = fs::path();
@@ -181,13 +206,6 @@ public:
 	fs::path originalpath;
 	fs::path backuppath;
 	bool originalexisted = false;
-	BackupFile(fs::path originallocation) {
-		originalpath = casePath(originallocation);
-		backuppath = folderbackups / originalpath.filename();
-		if (fs::exists(originalpath)) {
-			originalexisted = true;
-		}
-	}
 	auto backupExists() {
 		if (fs::exists(backuppath)) {
 			return true;
@@ -205,42 +223,55 @@ public:
 			originalexisted
 			|| backupExists()
 			) {
-			copyWait(backuppath, originalpath);
+			copyWait(backuppath, originalpath, true);
 			logbackups.writeText("Restored backup of file \"" + OutputPath(originalpath) + "\" at \"" + OutputPath(backuppath) + "\".");
 			deleteBackup();
 		}
 	}
-	auto createBackup() {
+	BackupFile(fs::path originallocation) {
+		originalpath = casePath(originallocation);
+		backuppath = folderbackups / originalpath.filename();
+		if (fs::exists(originalpath)) {
+			originalexisted = true;
+		}
+	}
+	auto initializeBackup() {
 		if (backupExists()) {
 			if (modMessage("File \"" + OutputPath(originalpath) + "\" already found backed-up at \"" + OutputPath(backuppath) + "\". Restore it before deleting?", MB_YESNO | MB_ICONWARNING) == IDYES) {
 				originalexisted = true;
 				restoreBackup();
 			}
+			deleteBackup();
 		}
-		deleteBackup();
+	}
+	auto createBackup() {
 		if (originalexisted) {
 			copyWait(originalpath, storagebackups / backuppath.filename());
 
 			copyWait(originalpath, backuppath);
 			logbackups.writeText("Created backup of file \"" + OutputPath(originalpath) + "\" at \"" + OutputPath(backuppath) + "\".");
 		}
-		else {
-			if (modMessage("File \"" + OutputPath(originalpath) + "\" not found when it was needed. Would you like for the game to automatically close after loading? The file will probably have been generated by then.", MB_YESNO | MB_ICONERROR) == IDYES) {
-				Events::processScriptsEvent += [] {
-					modMessage("The game will now automatically close.", MB_ICONWARNING);
-					exit(EXIT_SUCCESS);
-				};
-			}
+	}
+	auto warnBackup() {
+		if (originalexisted) return true;
+
+		if (modMessage("File \"" + OutputPath(originalpath) + "\" not found when it was needed. Would you like for the game to automatically close after loading? The file will probably have been generated by then.", MB_YESNO | MB_ICONERROR) == IDYES) {
+			Events::processScriptsEvent += [] {
+				modMessage("The game will now automatically close.", MB_ICONWARNING);
+				exit(EXIT_SUCCESS);
+			};
 		}
+		return false;
 	}
 };
 //limiter>
 auto backupflaconfig = BackupFile(loadedfla.modulepath / fs::path("fastman92limitAdjuster_GTASA").replace_extension(".ini"));
-auto backupflaweapon = BackupFile(loadedfla.modulepath / fs::path("data") / fs::path("gtasa_weapon_config").replace_extension(".dat"));
-auto backupflaaudio = BackupFile(loadedfla.modulepath / fs::path("data") / fs::path("gtasa_vehicleAudioSettings").replace_extension(".cfg"));
-auto backupflamodel = BackupFile(loadedfla.modulepath / fs::path("data") / fs::path("model_special_features").replace_extension(".dat"));
-auto backupflablip = BackupFile(loadedfla.modulepath / fs::path("data") / fs::path("gtasa_radarBlipSpriteFilenames").replace_extension(".dat"));
-auto backupflacombo = BackupFile(loadedfla.modulepath / fs::path("data") / fs::path("gtasa_melee_config").replace_extension(".dat"));
+auto backupflaweapon = BackupFile(loadedfla.modulepath / locationdata / fs::path("gtasa_weapon_config").replace_extension(".dat"));
+auto backupflaaudio = BackupFile(loadedfla.modulepath / locationdata / fs::path("gtasa_vehicleAudioSettings").replace_extension(".cfg"));
+auto backupflamodel = BackupFile(loadedfla.modulepath / locationdata / fs::path("model_special_features").replace_extension(".dat"));
+auto backupflablip = BackupFile(loadedfla.modulepath / locationdata / fs::path("gtasa_radarBlipSpriteFilenames").replace_extension(".dat"));
+auto backupflacombo = BackupFile(loadedfla.modulepath / locationdata / fs::path("gtasa_melee_config").replace_extension(".dat"));
+auto backupflatrain = BackupFile(loadedfla.modulepath / locationdata / fs::path("gtasa_trainTypeCarriages").replace_extension(".dat"));
 //<limiter
 
 #define CHARIGNORE '$'
@@ -254,6 +285,7 @@ auto backupflacombo = BackupFile(loadedfla.modulepath / fs::path("data") / fs::p
 #define CHARCLOTH '@'
 #define CHARBLIP ','
 #define CHARCOMBO '%'
+#define CHARTRAIN ')'
 //<limiter
 #define CHARDAMAGE '`'
 #define CHARTIMED '+'
@@ -277,6 +309,7 @@ auto backupflacombo = BackupFile(loadedfla.modulepath / fs::path("data") / fs::p
 #define SECTIONBLP "blp:"
 #define SECTIONBLT "blt:"
 #define SECTIONMEL "mel:"
+#define SECTIONTRN "trn:"
 //<limiter
 #define SECTIONFLS "fls:"
 #define SECTIONSPC "spc:"
@@ -304,17 +337,17 @@ auto filesauid3 = filesml;
 auto fileside = filesml;
 auto filestxt = filesml;
 
-auto deleteGenerated() {
-	for (auto filepath : filesauid3) {
-		fs::remove(filepath.replace_extension(EXTENSIONIDE));
-		fs::remove(filepath.replace_extension(EXTENSIONIPL));
-		fs::remove(filepath.replace_extension(EXTENSIONTXT));
-	}
-}
+auto Gfilesection = bool(false);
+auto Gfileskip = bool(false);
+auto Glinenumber = int(0);
 
-auto readDat(fs::path datstem) {
+auto Gauid3current = fs::path();
+auto Gauid3path = fs::path();
+auto Gauid3fla = bool(false);
+
+auto readDat(fs::path datstem, fs::path datfolder = folderdata) {
 	auto datfile = fstream();
-	datfile.open(folderroot / fs::path("data") / datstem.replace_extension(EXTENSIONDAT));
+	datfile.open(datfolder / datstem.replace_extension(EXTENSIONDAT));
 	if (datfile.is_open()) {
 		auto datline = string();
 		while (getline(datfile, datline)) {
@@ -466,9 +499,9 @@ auto Gflafile = fstream();
 auto FLAWrite(fs::path filepath, string flasection, bool skipemptylines) {
 	Gflafile.open(filepath, fstream::app);
 	if (Gflafile.is_open()) {
-		Gflafile << endl;
+		Gflafile << '\n';
 		AUID3Iterator(flasection, skipemptylines, [](string flaline, string flalower) {
-			Gflafile << flaline << endl;
+			Gflafile << flaline << '\n';
 		});
 		Gflafile.close();
 	}
@@ -506,6 +539,7 @@ auto limitmodels = int(20000);
 auto limitweapons = int(70);
 auto limitblips = int(64);
 auto limitcombos = int(17);
+auto limittrains = int(16);
 //<limiter
 
 auto modelsused = set<int>();
@@ -547,6 +581,12 @@ SCANFUNCTION
 #undef SCANUSED
 #define SCANUSED combosused
 SCANFUNCTION
+
+#undef SCANNAME
+#define SCANNAME trainScan
+#undef SCANUSED
+#define SCANUSED trainsused
+SCANFUNCTION
 //<limiter
 
 auto freekillables = modelsused;
@@ -555,6 +595,7 @@ auto freemodels = modelsused;
 auto freeweapons = modelsused;
 auto freeblips = modelsused;
 auto freecombos = modelsused;
+auto freetrains = modelsused;
 //<limiter
 
 auto auid3sids = map<fs::path, int>();
@@ -745,19 +786,8 @@ auto saveiniclothtextures = saveiniplayerweapons;
 auto saveiniblipsprites = saveiniplayerweapons;
 auto saveiniplayercombo = saveiniplayerweapons;
 //<limiter
-auto savePaths(fs::path savelocation) {
-	auto savepath = fs::path(savelocation);
-	auto savehash = int(0);
-	auto savefile = fstream();
-	savefile.open(savepath, fstream::in | fstream::binary);
-	if (savefile.is_open()) {
-		auto savesize = fs::file_size(savepath);
-		auto savebuffer = vector<char>(savesize);
-		if (savefile.read(savebuffer.data(), savesize)) {
-			savehash = CRC::Calculate(savebuffer.data(), savesize, CRC::CRC_32());
-		}
-		savefile.close();
-	}
+auto savePaths(fs::path savepath) {
+	auto savehash = hashFile(savepath);
 	saveini = savepath.parent_path() / fs::path(modname) / fs::path(to_string(savehash));
 	//limiter>
 	saveINI(&saveiniplayerweapons, "playerweapons");
@@ -781,6 +811,7 @@ auto weaponsauid3s = idsauid3s;
 auto clothesauid3s = idsauid3s;
 auto blipsauid3s = idsauid3s;
 auto combosauid3s = idsauid3s;
+auto trainsauid3s = idsauid3s;
 //<limiter
 
 EXPORTFUNCTION auto AUID3ID(const char *auid3) {
@@ -821,6 +852,12 @@ APIFUNCTION
 #define APINAME comboAUID3
 #undef APIMAP
 #define APIMAP combosauid3s
+APIFUNCTION
+
+#undef APINAME
+#define APINAME trainAUID3
+#undef APIMAP
+#define APIMAP trainsauid3s
 APIFUNCTION
 //<limiter
 
@@ -1071,8 +1108,14 @@ public:
         // Initialise your plugin here
         
 //>
-		logmain.writeText("Version: " + to_string(modversion));
+		auto timerstart = chrono::high_resolution_clock::now();
 
+		if (loadedml.isinstalled) {
+			auto autoid3000ml = fs::path("AutoID3000ML").replace_extension(".dll");
+			copyWait(foldermod / autoid3000ml, folderml / fs::path(".data") / fs::path("plugins") / fs::path("gta3") / autoid3000ml);
+		}
+
+		logmain.writeText("Version: " + to_string(modversion));
 		logmain.newLine();
 
 		auto uninstallfile = fstream();
@@ -1089,14 +1132,15 @@ public:
 
 			:notEmpty
 				echo Not recommended to uninstall because:
-				echo    1. Backups exist.
+				echo    1. Backups exist. Launch the game and manage them before trying again.
 			goto exitScript
 
 			:isEmpty
 				echo Uninstall freely:
 				echo    1. Go to the game directory.
 				echo    2. Delete the file "#AutoID3000.asi".
-				echo    3. Optional: delete the folder "AutoID3000".
+				echo    3. Optional: Delete the folder "AutoID3000".
+				echo    4. Optional: If Mod Loader is installed, go to "modloader/.data/plugins/gta3" and delete the files "AutoID3000ML.dll" and "AutoID3000ML.log".
 			goto exitScript
 
 			:exitScript
@@ -1123,100 +1167,80 @@ public:
 		loadedLog(loadedfla, MODULEFLA);
 		loadedLog(loadedola, MODULEOLA);
 		logmain.newLine();
+		filesAll(folderroot, [](fs::path entrypath, fs::recursive_directory_iterator searchhandle) {
+			if (fs::is_directory(entrypath)) {
+				auto pathstring = lowerString((entrypath / fs::path()).string());
+				if (
+					pathstring == lowermod
+					|| pathstring == lowerml
+					) {
+					searchhandle.disable_recursion_pending();
+				}
+			}
+			else {
+				auto &filepath = entrypath;
+				auto fileextension = lowerString(filepath.extension().string());
+				if (fileextension == EXTENSIONAUID3) filesauid3.push_back(filepath);
+			}
+		});
 
-		if (loadedfla.isinstalled) {
-			//limiter>
-			backupflaconfig.createBackup();
-			backupflaweapon.createBackup();
-			Events::initPoolsEvent.before += [] {backupflaaudio.createBackup(); };
-			Events::initPoolsEvent.before += [] {backupflamodel.createBackup(); };
-			backupflablip.createBackup();
-			backupflacombo.createBackup();
+		readDat("default");
+		readDat("gta");
 
-			Events::attachRwPluginsEvent += [] {backupflaconfig.restoreBackup(); };
-			Events::attachRwPluginsEvent += [] {backupflaweapon.restoreBackup(); };
-			Events::initGameEvent.after += [] {backupflaaudio.restoreBackup(); };
-			Events::initGameEvent.after += [] {backupflamodel.restoreBackup(); };
-			Events::attachRwPluginsEvent += [] {backupflablip.restoreBackup(); };
-			Events::attachRwPluginsEvent += [] {backupflacombo.restoreBackup(); };
-			//<limiter
-		}
-
-		if (
-			(!loadedfla.isinstalled
-				|| (
-					//limiter>
-					backupflaconfig.originalexisted
-					&& backupflaweapon.originalexisted
-					&& backupflaaudio.originalexisted
-					&& backupflamodel.originalexisted
-					&& backupflablip.originalexisted
-					&& backupflacombo.originalexisted
-					//<limiter
-					)
-				)
-			//&& 
-			) {
-			filesAll(folderroot, [](fs::path entrypath, fs::recursive_directory_iterator searchhandle) {
-				if (fs::is_directory(entrypath)) {
-					auto pathstring = lowerString((entrypath / fs::path()).string());
-					if (
-						pathstring == lowermod
-						|| pathstring == lowerml
-						) {
+		if (loadedml.isinstalled) {
+			filesAll(folderml, [](fs::path entrypath, fs::recursive_directory_iterator searchhandle) {
+				if (entrypath.stem().string()[0] == CHARML) {
+					if (fs::is_directory(entrypath)) {
 						searchhandle.disable_recursion_pending();
 					}
 				}
 				else {
-					auto &filepath = entrypath;
-					auto fileextension = lowerString(filepath.extension().string());
-					if (fileextension == EXTENSIONAUID3) filesauid3.push_back(filepath);
+					filesml.push_back(entrypath);
 				}
 			});
 
-			readDat("default");
-			readDat("gta");
+			{
+				//filter 'filesml' by replicating Mod Loader behaviour
+				//ignore files and folders beginning with a '.' (dot): DONE
 
-			if (loadedml.isinstalled) {
-				filesAll(folderml, [](fs::path entrypath, fs::recursive_directory_iterator searchhandle) {
-					if (entrypath.stem().string()[0] == CHARML) {
-						if (fs::is_directory(entrypath)) {
-							searchhandle.disable_recursion_pending();
-						}
-					}
-					else {
-						filesml.push_back(entrypath);
-					}
-				});
-
-				{
-					//filter 'filesml' by replicating Mod Loader behaviour
-					//ignore files and folders beginning with a '.' (dot): DONE
-
-				}
-
-				for (auto filepath : filesml) {
-					auto fileextension = lowerString(filepath.extension().string());
-					if (fileextension == EXTENSIONAUID3) filesauid3.push_back(filepath);
-					else if (fileextension == EXTENSIONIDE) fileside.push_back(filepath);
-					else if (fileextension == EXTENSIONTXT) filestxt.push_back(filepath);
-				}
 			}
 
+			for (auto filepath : filesml) {
+				auto fileextension = lowerString(filepath.extension().string());
+				if (fileextension == EXTENSIONAUID3) filesauid3.push_back(filepath);
+				else if (fileextension == EXTENSIONIDE) fileside.push_back(filepath);
+				else if (fileextension == EXTENSIONTXT && fs::file_size(filepath) < 61440) filestxt.push_back(filepath);
+			}
+		}
+
+		if (filesauid3.size() > 0) {
+			auto deleteGenerated = []() {
+				for (auto filepath : filesauid3) {
+					fs::remove(filepath.replace_extension(EXTENSIONIDE));
+					fs::remove(filepath.replace_extension(EXTENSIONIPL));
+					fs::remove(filepath.replace_extension(EXTENSIONTXT));
+				}
+			};
 			deleteGenerated();
 			Events::shutdownRwEvent += deleteGenerated;
 
-			static auto Gfilesection = bool(false);
-			static auto Gfileskip = bool(false);
-			static auto Glinenumber = int(0);
-
-			static auto Gauid3current = fs::path();
-			static auto Gauid3path = fs::path();
-			static auto Gauid3fla = bool(false);
+			auto removeDeleted = [](vector<fs::path> *filepaths) {
+				filepaths->erase(
+					remove_if(
+						filepaths->begin(), filepaths->end(),
+						[](fs::path filepath) {
+					if (!fs::exists(filepath)) return true;
+					return false;
+				}
+					), filepaths->end()
+					);
+			};
+			removeDeleted(&fileside);
+			removeDeleted(&filestxt);
 
 			#define LOGEXTENSION "AUID3"
 			#define LOGFILES filesauid3
-			#define LOGREAD logfiles.writeText("Read " + string(LOGEXTENSION) + " files:"); for (auto filepath : LOGFILES) {
+			#define LOGREAD logfiles.writeText("Read " + string(LOGEXTENSION) + " files: " + to_string(LOGFILES.size())); for (auto filepath : LOGFILES) {
 			#define LOGLINE logfiles.newLine();
 			LOGREAD
 				auid3names.insert(filepath.stem().string());
@@ -1247,6 +1271,7 @@ public:
 						auto fileextension = lowerString(Gauid3current.extension().string());
 						if (
 							fileextension == EXTENSIONIDE
+							|| fileextension == EXTENSIONIPL
 							|| fileextension == EXTENSIONTXT
 							) {
 							Gfilesection = false;
@@ -1262,6 +1287,7 @@ public:
 					else if (linelower == SECTIONBLP) Gfilesection = true, Gfileskip = true, Gauid3current = SECTIONBLP, Gauid3fla = true;
 					else if (linelower == SECTIONBLT) Gfilesection = true, Gfileskip = true, Gauid3current = SECTIONBLT, Gauid3fla = true;
 					else if (linelower == SECTIONMEL) Gfilesection = true, Gfileskip = true, Gauid3current = SECTIONMEL, Gauid3fla = true;
+					else if (linelower == SECTIONTRN) Gfilesection = true, Gfileskip = true, Gauid3current = SECTIONTRN, Gauid3fla = true;
 					//<limiter
 
 					if (
@@ -1275,6 +1301,8 @@ public:
 						if (auid3string == SECTIONWPN) weaponScan(fileline);
 						if (auid3string == SECTIONBLP) blipScan(fileline);
 						if (auid3string == SECTIONBLT) fileline = (Gauid3path.parent_path() / fs::path(fileline)).string();
+						if (auid3string == SECTIONMEL) comboScan(fileline);
+						if (auid3string == SECTIONTRN) trainScan(fileline);
 						//<limiter
 
 						linesAdd(Gauid3current, fileline);
@@ -1284,18 +1312,21 @@ public:
 			}
 			LOGLINE
 
-			if (
-				!loadedfla.isinstalled
-				&& Gauid3fla
-				) {
-				if (modMessage("Current " + modname + " configuration requires " + MODULEFLA + " which could not be detected. Would you like to close the game? It will probably crash anyway.", MB_YESNO | MB_ICONWARNING) == IDYES) {
-					exit(EXIT_SUCCESS);
-				}
-			}
-
 			AUID3Iterator(SECTIONDEF, true, [](string auid3line, string auid3lower) {
 				auid3names.insert(auid3line);
 			});
+
+			auto sectionExists = [](string auid3section){
+				auto sectionfind = linesfiles.find(auid3section);
+				if (sectionfind != linesfiles.end()) return true;
+				return false;
+			};
+			auto sectionsExist = [&sectionExists](vector<string> auid3sections) {
+				for (auto auid3section : auid3sections) {
+					if (sectionExists(auid3section)) return true;
+				}
+				return false;
+			};
 
 			auto arekillable = int(0);
 			auto areped = arekillable;
@@ -1308,6 +1339,7 @@ public:
 			auto arecloth = arekillable;
 			auto areblip = arekillable;
 			auto arecombo = arekillable;
+			auto aretrain = arekillable;
 			//<limiter
 			auto aredamage = arekillable;
 			auto aretimed = arekillable;
@@ -1355,6 +1387,9 @@ public:
 					}
 					else if (firstchar == CHARCOMBO) {
 						++arecombo;
+					}
+					else if (firstchar == CHARTRAIN) {
+						++aretrain;
 					}
 					//<limiter
 					else {
@@ -1423,6 +1458,11 @@ public:
 				linesAdd(SECTIONFLB, "weapon limits:enable melee combo type loader");
 				linesAdd(SECTIONFLC, "weapon limits:max number of melee combos:17:255");
 			}
+			if (aretrain > 0) {
+				linesAdd(SECTIONFLB, "addons:enable train type carriages loader");
+				linesAdd(SECTIONFLC, "addons:train type carriage loader, max number of vehicles for type:15:255");
+				linesAdd(SECTIONFLC, "addons:train type carriage loader, number of type ids:16:255");
+			}
 			//<limiter
 			if (aredamage > 0) {
 				linesAdd(SECTIONFLA, "ide limits:ide objects type 2:70:" + to_string(aredamage));
@@ -1443,12 +1483,100 @@ public:
 				linesAdd(SECTIONFLA, "dynamic limits:colmodels:10150:" + to_string(arecol));
 			}
 
+			//limiter>
+			#define EXISTSFLABC sectionsExist({ SECTIONFLA, SECTIONFLB, SECTIONFLC })
+			#define EXISTSWPN sectionExists(SECTIONWPN)
+			#define EXISTSFLS sectionExists(SECTIONFLS)
+			#define EXISTSSPC sectionExists(SECTIONSPC)
+			#define EXISTSBLP sectionExists(SECTIONBLP)
+			#define EXISTSMEL sectionExists(SECTIONMEL)
+			#define EXISTSTRN sectionExists(SECTIONTRN)
+			//<limiter
+
+			//limiter>
+			if (loadedfla.isinstalled) {
+				backupflaconfig.initializeBackup();
+				backupflaweapon.initializeBackup();
+				backupflaaudio.initializeBackup();
+				backupflamodel.initializeBackup();
+				backupflablip.initializeBackup();
+				backupflacombo.initializeBackup();
+				backupflatrain.initializeBackup();
+			}
+			//<limiter
+
+			if (
+				(!loadedfla.isinstalled
+					|| (
+						//limiter>
+							backupflaconfig.warnBackup()
+						&&	backupflaweapon.warnBackup()
+						&&	backupflaaudio.warnBackup()
+						&&	backupflamodel.warnBackup()
+						&&	backupflablip.warnBackup()
+						&&	backupflacombo.warnBackup()
+						&&	backupflatrain.warnBackup()
+						//<limiter
+						)
+					)
+				//&& 
+				) {
+
+			if (
+				!loadedfla.isinstalled
+				&& Gauid3fla
+				) {
+				if (modMessage("Current " + modname + " configuration requires " + MODULEFLA + " which could not be detected. Would you like to close the game? It will probably crash anyway.", MB_YESNO | MB_ICONWARNING) == IDYES) {
+					exit(EXIT_SUCCESS);
+				}
+			}
+
+			if (loadedfla.isinstalled) {
+				//limiter>
+				if (EXISTSFLABC) {
+					backupflaconfig.createBackup();
+					Events::attachRwPluginsEvent += [] {backupflaconfig.restoreBackup(); };
+				}
+
+				if (EXISTSWPN) {
+					backupflaweapon.createBackup();
+					Events::attachRwPluginsEvent += [] {backupflaweapon.restoreBackup(); };
+				}
+
+				if (EXISTSFLS) {
+					Events::initPoolsEvent.before += [] {backupflaaudio.createBackup(); };
+					Events::initGameEvent.after += [] {backupflaaudio.restoreBackup(); };
+				}
+
+				if (EXISTSSPC) {
+					Events::initPoolsEvent.before += [] {backupflamodel.createBackup(); };
+					Events::initGameEvent.after += [] {backupflamodel.restoreBackup(); };
+				}
+
+				if (EXISTSBLP) {
+					backupflablip.createBackup();
+					Events::attachRwPluginsEvent += [] {backupflablip.restoreBackup(); };
+				}
+
+				if (EXISTSMEL) {
+					backupflacombo.createBackup();
+					Events::attachRwPluginsEvent += [] {backupflacombo.restoreBackup(); };
+				}
+
+				if (EXISTSTRN) {
+					backupflatrain.createBackup();
+					Events::attachRwPluginsEvent += [] {backupflatrain.restoreBackup(); };
+				}
+				//<limiter
+			}
+
 			auto fillIDs = [](int startid, int endid, set<int> *idset) {for (auto currentid = startid; currentid <= endid; ++currentid) idset->insert(currentid); };
 			//limiter>
 			fillIDs(0, 10, &modelsused); fillIDs(374, 383, &modelsused); fillIDs(15000, 15024, &modelsused);
 			fillIDs(0, 69, &weaponsused);
 			fillIDs(0, 63, &blipsused);
 			fillIDs(0, 16, &combosused);
+			fillIDs(0, 15, &trainsused);
 			//<limiter
 
 			#undef LOGEXTENSION
@@ -1501,17 +1629,19 @@ public:
 			LOGLINE
 
 			if (loadedfla.isinstalled) {
-				auto flalower = fstream();
-				flalower.open(backupflaconfig.originalpath.string(), fstream::in);
-				auto flabuffer = stringstream();
-				flabuffer << flalower.rdbuf();
-				flalower.close();
-				auto flastring = lowerString(flabuffer.str());
-				flalower.open(backupflaconfig.originalpath.string(), fstream::out);
-				flalower << flastring;
-				flalower.close();
+				if (EXISTSFLABC) {
+					auto flalower = fstream();
+					flalower.open(backupflaconfig.originalpath.string(), fstream::in);
+					auto flabuffer = stringstream();
+					flabuffer << flalower.rdbuf();
+					flalower.close();
+					auto flastring = lowerString(flabuffer.str());
+					flalower.open(backupflaconfig.originalpath.string(), fstream::out);
+					flalower << flastring;
+					flalower.close();
 
-				FLAApply();
+					FLAApply();
+				}
 
 				auto flalimits = CIniReader(backupflaconfig.originalpath.string());
 				limitkillables = flalimits.ReadInteger("id limits", "count of killable model ids", limitkillables);
@@ -1531,6 +1661,10 @@ public:
 				if (flalimits.ReadInteger("weapon limits", "enable melee combo type loader", 1) == 1) {
 					limitcombos = flalimits.ReadInteger("weapon limits", "max number of melee combos", limitcombos);
 				}
+
+				if (flalimits.ReadInteger("addons", "enable train type carriages loader", 1) == 1) {
+					limittrains = flalimits.ReadInteger("addons", "train type carriage loader, number of type ids", limittrains);
+				}
 				//<limiter
 			}
 
@@ -1540,6 +1674,7 @@ public:
 			limitweapons--;
 			limitblips--;
 			limitcombos--;
+			limittrains--;
 			//<limiter
 
 			#define MESSAGEFREE string("Run out of free ")
@@ -1554,6 +1689,7 @@ public:
 			#define MESSAGEWEAPON string("weapon")
 			#define MESSAGEBLIP string("blip")
 			#define MESSAGECOMBO string("combo")
+			#define MESSAGETRAIN string("train")
 			//<limiter
 
 			#define MESSAGENAME MESSAGEKILLABLE
@@ -1567,24 +1703,32 @@ public:
 			#define MESSAGELIMIT limitmodels
 			MESSAGEASSIGN
 			//limiter>
-			#undef MESSAGENAME 
+			#undef MESSAGENAME
 			#define MESSAGENAME MESSAGEWEAPON
 			#undef MESSAGELIMIT 
 			#define MESSAGELIMIT limitweapons
 			MESSAGEASSIGN
 
-			#undef MESSAGENAME 
+			#undef MESSAGENAME
 			#define MESSAGENAME MESSAGEBLIP
 			#undef MESSAGELIMIT 
 			#define MESSAGELIMIT limitblips
 			MESSAGEASSIGN
 
-			#undef MESSAGENAME 
+			#undef MESSAGENAME
 			#define MESSAGENAME MESSAGECOMBO
 			#undef MESSAGELIMIT 
 			#define MESSAGELIMIT limitcombos
 			MESSAGEASSIGN
+
+			#undef MESSAGENAME
+			#define MESSAGENAME MESSAGETRAIN
+			#undef MESSAGELIMIT 
+			#define MESSAGELIMIT limittrains
+			MESSAGEASSIGN
 			//<limiter
+
+			logmain.newLine();
 
 			for (auto modelid = int(0); modelid <= limitmodels; ++modelid) {
 				if (modelsused.find(modelid) == modelsused.end()) {
@@ -1610,6 +1754,10 @@ public:
 				linesFile(backupflacombo.originalpath, false, [](string fileline, string linelower) {
 					comboScan(fileline);
 				});
+
+				linesFile(backupflatrain.originalpath, false, [](string fileline, string linelower) {
+					trainScan(fileline);
+				});
 				//<limiter
 			}
 
@@ -1625,6 +1773,7 @@ public:
 			usedIDs(&limitweapons, &weaponsused, &freeweapons);
 			usedIDs(&limitblips, &blipsused, &freeblips);
 			usedIDs(&limitcombos, &combosused, &freecombos);
+			usedIDs(&limittrains, &trainsused, &freetrains);
 			//<limiter
 
 			auto indexmodels = int(0);
@@ -1633,6 +1782,7 @@ public:
 			auto indexweapons = indexmodels;
 			auto indexblips = indexmodels;
 			auto indexcombos = indexmodels;
+			auto indextrains = indexmodels;
 			//<limiter
 
 			auto maxmodels = freemodels.size();
@@ -1641,6 +1791,7 @@ public:
 			auto maxweapons = freeweapons.size();
 			auto maxblips = freeblips.size();
 			auto maxcombos = freecombos.size();
+			auto maxtrains = freetrains.size();
 			//<limiter
 
 			auto messagemodels = bool(false);
@@ -1648,6 +1799,7 @@ public:
 			auto messageweapons = messagemodels;
 			auto messageblips = messagemodels;
 			auto messagecombos = messagemodels;
+			auto messagetrains = messagemodels;
 			//<limiter
 
 			#define ASSIGNSTOP + "."
@@ -1701,6 +1853,9 @@ public:
 					else if (firstchar == CHARCOMBO) {
 						assignID(&indexcombos, maxcombos, freecombos, auid3name, MESSAGECOMBO, false, &messagecombos);
 					}
+					else if (firstchar == CHARTRAIN) {
+						assignID(&indextrains, maxtrains, freetrains, auid3name, MESSAGETRAIN, false, &messagetrains);
+					}
 					//<limiter
 					else {
 						#undef FORCEFIRST
@@ -1722,6 +1877,7 @@ public:
 				else if (auid3string[0] == CHARCLOTH) clothesauid3s[clothesHash(auid3string)] = auid3string;
 				else if (auid3string[0] == CHARBLIP) blipsauid3s[auid3id] = auid3string;
 				else if (auid3string[0] == CHARCOMBO) combosauid3s[auid3id] = auid3string;
+				else if (auid3string[0] == CHARTRAIN) trainsauid3s[auid3id] = auid3string;
 				//<limiter
 				else idsauid3s[auid3id] = auid3string;
 			}
@@ -1740,6 +1896,7 @@ public:
 			logFree(MESSAGEWEAPON, &freeweapons, &weaponsauid3s);
 			logFree(MESSAGEBLIP, &freeblips, &blipsauid3s);
 			logFree(MESSAGECOMBO, &freecombos, &combosauid3s);
+			logFree(MESSAGETRAIN, &freetrains, &trainsauid3s);
 			//<limiter
 
 			auto messageunassigned = bool(false);
@@ -1796,33 +1953,41 @@ public:
 
 			if (loadedfla.isinstalled) {
 				//limiter>
-				FLAWrite(backupflaweapon.originalpath, SECTIONWPN, true);
+				if (EXISTSWPN) {
+					FLAWrite(backupflaweapon.originalpath, SECTIONWPN, true);
+				}
 
-				Events::initPoolsEvent.after += [] {
-					auto flslines = vector<string>();
-					Gflafile.open(backupflaaudio.originalpath, fstream::in);
-					if (Gflafile.is_open()) {
-						auto flsline = string();
-						while (getline(Gflafile, flsline)) {
-							if (lowerString(flsline) == ";the end") break;
-							if (flsline.length() > 0) flslines.push_back(flsline);
+				if (EXISTSFLS) {
+					Events::initPoolsEvent.after += [] {
+						auto flslines = vector<string>();
+						Gflafile.open(backupflaaudio.originalpath, fstream::in);
+						if (Gflafile.is_open()) {
+							auto flsline = string();
+							while (getline(Gflafile, flsline)) {
+								if (lowerString(flsline) == ";the end") break;
+								if (flsline.length() > 0) flslines.push_back(flsline);
+							}
+							Gflafile.close();
 						}
+						auto flsfind = linesfiles.find(SECTIONFLS);
+						if (flsfind != linesfiles.end()) {
+							for (auto flsline : flsfind->second) if (flsline.length() > 0) flslines.push_back(flsline);
+							flsfind->second.clear();
+						}
+						flslines.push_back(";the end");
+						Gflafile.open(backupflaaudio.originalpath, fstream::out);
+						for (auto flsline : flslines) Gflafile << flsline << '\n';
 						Gflafile.close();
-					}
-					auto flsfind = linesfiles.find(SECTIONFLS);
-					if (flsfind != linesfiles.end()) {
-						for (auto flsline : flsfind->second) if (flsline.length() > 0) flslines.push_back(flsline);
-						flsfind->second.clear();
-					}
-					flslines.push_back(";the end");
-					Gflafile.open(backupflaaudio.originalpath, fstream::out);
-					for (auto flsline : flslines) Gflafile << flsline << endl;
-					Gflafile.close();
-				};
+					};
+				}
 
-				Events::initPoolsEvent.after += [] { FLAWrite(backupflamodel.originalpath, SECTIONSPC, true); };
+				if (EXISTSSPC) {
+					Events::initPoolsEvent.after += [] { FLAWrite(backupflamodel.originalpath, SECTIONSPC, true); };
+				}
 
-				FLAWrite(backupflablip.originalpath, SECTIONBLP, true);
+				if (EXISTSBLP) {
+					FLAWrite(backupflablip.originalpath, SECTIONBLP, true);
+				}
 
 				Events::initGameEvent += [] {
 					static auto blipssprites = patch::Get<CSprite2d *>(0x5827EB, true);
@@ -1846,17 +2011,37 @@ public:
 					});
 				};
 
-				FLAWrite(backupflacombo.originalpath, SECTIONMEL, true);
+				if (EXISTSMEL) {
+					FLAWrite(backupflacombo.originalpath, SECTIONMEL, true);
+				}
+
+				if (EXISTSTRN) {
+					FLAWrite(backupflatrain.originalpath, SECTIONTRN, true);
+				}
 				//<limiter
 			}
 
 			for (auto filepath : linesfiles) {
 				if (filepath.second.size() > 0) {
 					auto linesfile = fstream();
+
+					//more trouble than it's worth
+					//auto &currentlines = filepath.second;
+					//auto &savedfile = linesfile; savedfile.open(filepath.first, fstream::in);
+					//if (savedfile.is_open()) {
+					//	auto currentstring = string(); for (auto currentline : currentlines) currentstring += currentline + '\n';
+					//	auto currenthash = CRC::Calculate(currentstring.data(), currentstring.size(), CRC::CRC_32());
+					//	auto savedbuffer = stringstream(); savedbuffer << savedfile.rdbuf();
+					//	auto savedstring = savedbuffer.str();
+					//	auto savedhash = CRC::Calculate(savedstring.data(), savedstring.size(), CRC::CRC_32());
+					//	savedfile.close();
+					//	if (currenthash = savedhash) continue;
+					//}
+
 					linesfile.open(filepath.first, fstream::out);
 					if (linesfile.is_open()) {
 						for (auto fileline : filepath.second) {
-							linesfile << fileline << endl;
+							linesfile << fileline + '\n';
 						}
 						linesfile.close();
 					}
@@ -2333,15 +2518,24 @@ public:
 			#undef BOXTYPE
 			#define BOXTYPE MESSAGECOMBO
 			BOXMESSAGE
+
+			#undef BOXBOOL
+			#define BOXBOOL messagetrains
+			#undef BOXTYPE
+			#define BOXTYPE MESSAGETRAIN
+			BOXMESSAGE
 			//<limiter
 			if (messageunassigned) modMessage("One or more AUID3s have unassigned"  + MESSAGEIDS ASSIGNSTOP, MB_ICONERROR);
+
+			logmain.writeText("Approximate time taken: " + to_string((chrono::duration_cast<chrono::milliseconds>(chrono::high_resolution_clock::now() - timerstart)).count()) + "ms.");
 		}
 		else {
 			modMessage(modname + " will not work for this session.", MB_ICONWARNING);
 		}
-
-		logmain.newLine();
-		logmain.writeText("Approximate time taken: " + to_string((chrono::duration_cast<chrono::milliseconds>(chrono::high_resolution_clock::now() - timerstart)).count()) + "ms.");
+	}
+	else {
+		logmain.writeText("No AUID3 files found.");
+	}
 //<
     }
 //>
