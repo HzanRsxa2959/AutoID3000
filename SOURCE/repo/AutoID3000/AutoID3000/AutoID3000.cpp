@@ -27,7 +27,7 @@ namespace fs = filesystem;
 
 #define EXPORTFUNCTION extern "C" __declspec(dllexport)
 
-auto modversion = int(3002);
+auto modversion = int(3003);
 EXPORTFUNCTION auto modVersion() {
 	return modversion;
 }
@@ -78,8 +78,9 @@ class LoadedModule {
 public:
 	fs::path modulepath;
 	bool isinstalled = false;
-	LoadedModule(fs::path modulestem, fs::path mlfolder = "") {
-		auto modulename = modulestem.replace_extension(".asi");
+	LoadedModule(fs::path modulestem, fs::path mlfolder = "", bool noextension = true) {
+		auto modulename = modulestem;
+		if(noextension) modulename.replace_extension(".asi");
 		if (fs::exists(folderroot / modulename)) {
 			modulepath = folderroot;
 			isinstalled = true;
@@ -187,16 +188,17 @@ auto copyWait(fs::path sourcepath, fs::path targetpath, bool showmessage = false
 }
 
 auto outputroot = (casePath(folderroot) / fs::path()).string();
-auto outputlength = outputroot.length();
-auto OutputPath(fs::path filepath) {
+auto OutputPath(fs::path filepath, string matchpath = outputroot, bool nodot = false) {
 	filepath = casePath(filepath);
 	auto pathstring = filepath.string();
 	while (true) {
-		auto pathfind = pathstring.find(outputroot);
+		auto pathfind = pathstring.find(matchpath);
 		if (pathfind == string::npos) break;
-		pathstring.erase(pathfind, outputlength);
+		pathstring.erase(pathfind, matchpath.length());
 	}
-	return (fs::path(".") / fs::path(pathstring)).string();
+	auto retpath = fs::path(pathstring);
+	if (!nodot) retpath = fs::path(".") / retpath;
+	return retpath.string();
 }
 
 auto storagebackups = fs::path();
@@ -332,7 +334,7 @@ auto filesAll(fs::path searchpath, void(*searchcallback)(fs::path, fs::recursive
 		}
 	}
 }
-auto filesml = vector<fs::path>();
+auto filesml = set<fs::path>();
 auto filesauid3 = filesml;
 auto fileside = filesml;
 auto filestxt = filesml;
@@ -344,23 +346,6 @@ auto Glinenumber = int(0);
 auto Gauid3current = fs::path();
 auto Gauid3path = fs::path();
 auto Gauid3fla = bool(false);
-
-auto readDat(fs::path datstem, fs::path datfolder = folderdata) {
-	auto datfile = fstream();
-	datfile.open(datfolder / datstem.replace_extension(EXTENSIONDAT));
-	if (datfile.is_open()) {
-		auto datline = string();
-		while (getline(datfile, datline)) {
-			if (
-				datline.length() > 4
-				&& lowerString(datline).substr(0, 4) == "ide "
-				) {
-				fileside.push_back(folderroot / fs::path(datline.substr(4)));
-			}
-		}
-		datfile.close();
-	}
-}
 
 auto auid3names = set<string>();
 
@@ -1100,6 +1085,63 @@ auto saveApply() {
 	saveplayercombo.id = 0;
 	//<limiter
 }
+
+bool match_wildcard(const char* pattern, const char* string) {
+	bool allow_subdir = false;
+	bool had_anydir_in_pattern = false;
+	while (true)
+	{
+		switch (*pattern++)
+		{
+		case '\0':
+			if (*string == '\0') return true;
+			if ((*string == '/' || *string == '\\') && (*(string + 1) == '\0')) return true;
+			return false;
+
+		case '/':
+		case '\\':
+			if (*string != '/' && *string != '\\')
+			{
+				if (*string == '\0' && *pattern == '\0')
+					break;
+				return false;
+			}
+			++string;
+			had_anydir_in_pattern = true;
+			break;
+
+		case '*':
+			allow_subdir = (!had_anydir_in_pattern || (*pattern == '*'));
+			while (*pattern == '*') ++pattern;
+
+			if (*pattern == '\0')
+				return true;
+
+
+			for (; *string; ++string)
+			{
+				if (match_wildcard(string, pattern))
+					return true;
+				else if ((*string == '/' || *string == '\\') && !allow_subdir)
+					return false;
+			}
+
+			return false;
+
+		case '?':
+			if ((*string == '/' || *string == '\\') || *string == '\0')
+				return false;
+			++string;
+			break;
+
+		default:
+			if (*string == '\0' || tolower(*string) != tolower(*(pattern - 1)))
+				return false;
+			++string;
+			break;
+		}
+	}
+}
 //<
 
 class AutoID3000 {
@@ -1180,40 +1222,315 @@ public:
 			else {
 				auto &filepath = entrypath;
 				auto fileextension = lowerString(filepath.extension().string());
-				if (fileextension == EXTENSIONAUID3) filesauid3.push_back(filepath);
+				if (fileextension == EXTENSIONAUID3) filesauid3.insert(filepath);
 			}
 		});
 
-		readDat("default");
-		readDat("gta");
-
+		auto filesgtadat = set<fs::path>();
 		if (loadedml.isinstalled) {
-			filesAll(folderml, [](fs::path entrypath, fs::recursive_directory_iterator searchhandle) {
-				if (entrypath.stem().string()[0] == CHARML) {
-					if (fs::is_directory(entrypath)) {
-						searchhandle.disable_recursion_pending();
+			{
+				//filter 'filesml' by replicating Mod Loader behaviour: DONE
+				struct MLCMD { //stores mod loader commandline data
+					bool none = false; //'-nomods'
+					set<string> mods; //list of mods passed through '-mod "mod 1"', '-mod "mod 2"' and so on
+					string profile = "default"; //name of profile passed through '-modprof "name"', only the last one is used
+				};
+				auto parseCommandLine = []() { //parses the commandline, taken with slight modifications from https://github.com/thelink2012/modloader/blob/18f85c2766d4e052a452c7b1d8f5860a6daac24b/src/core/config.cpp#L74
+					auto modlist = MLCMD();
+					char buf[512];
+					wchar_t **argv; int argc;
+					argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+					if (argv) {
+						auto toASCII = [](const wchar_t* wstr, char* abuf, size_t asize) {
+							return !!WideCharToMultiByte(CP_ACP, 0, wstr, -1, abuf, asize, NULL, NULL);
+						};
+						std::string modprof;
+						bool has_nomods_cmd = false;
+						bool has_mod_cmd = false;
+						bool has_modprof_cmd = false;
+						for (int i = 0; i < argc; ++i) {
+							if (argv[i][0] == '-') {
+								wchar_t *arg = (i + 1 < argc ? argv[i + 1] : nullptr);
+								wchar_t *argname = &argv[i][1];
+								if (!_wcsicmp(argname, L"nomods")) has_nomods_cmd = true;
+								else if (!_wcsicmp(argname, L"mod")) {
+									if (arg == nullptr) break;
+									else if (toASCII(arg, buf, sizeof(buf))) {
+										modlist.mods.insert(buf);
+										has_mod_cmd = true;
+									}
+								}
+								else if (!_wcsicmp(argname, L"modprof")) {
+									if (arg == nullptr) break;
+									else if (toASCII(arg, buf, sizeof(buf))) {
+										modprof = buf;
+										has_modprof_cmd = true;
+									}
+								}
+							}
+						}
+						if (has_nomods_cmd) modlist.none = true;
+						else if (has_modprof_cmd) modlist.profile = lowerString(buf);
+						LocalFree(argv);
+					}
+					return modlist;
+				};
+				auto cmdline = parseCommandLine();
+				if (cmdline.none) filesml.clear(); //if commandline has '-nomods' then return no files
+				else {
+					struct MLProfile { //stores a mod loader profile
+						string name = ""; //[Folder.Config] -> Profile
+						string parent = ""; //[Profiles.Name.Config] -> Parents
+						bool ignore = false; //[Profiles.Name.Config] -> IgnoreAllMods
+						bool exclude = false; //[Profiles.Name.Config] -> ExcludeAllMods
+						string module = ""; //[Profiles.Name.Config] -> UseIfModule
+						set<string> files; //[Profiles.Name.IgnoreFiles]
+						set<string> ignored; //[Profiles.Name.IgnoreMods]
+						set<string> included; //[Profiles.Name.IncludeMods]
+						set<string> exclusive; //[Profiles.Name.ExclusiveMods]
+						auto print() {
+							logmain.writeText("name: " + name);
+							logmain.writeText("parent: " + parent);
+							logmain.writeText("ignore: " + to_string(ignore));
+							logmain.writeText("exclude: " + to_string(exclude));
+							logmain.writeText("module: " + module);
+							logmain.writeText("files:"); for (auto s : files) logmain.writeText("\t" + s);
+							logmain.writeText("ignored:"); for (auto s : ignored) logmain.writeText("\t" + s);
+							logmain.writeText("included:"); for (auto s : included) logmain.writeText("\t" + s);
+							logmain.writeText("exclusive:"); for (auto s : exclusive) logmain.writeText("\t" + s);
+						}
+					};
+					auto mlprofs = vector<MLProfile>(); //a vector containing all profiles, useful for finding one during e.g. inheritance
+					auto readProfile = [&mlprofs](fs::path profpath) { //read an ini file to an MLProfile and put it in the MLProfile vector above
+						auto proffile = fstream(); proffile.open(profpath);
+						if (proffile.is_open()) {
+							auto profile = MLProfile();
+							auto profstream = stringstream(); profstream << proffile.rdbuf();
+							auto profstring = lowerString(profstream.str()); profstream = stringstream(); profstream << profstring;
+							auto profstart = profstream.tellg();
+							auto profini = CIniReader(profstream);
+							auto profname = profini.ReadString("folder.config", "profile", "");
+							if (profname.length() > 0) {
+								profile.name = profname;
+								auto sectionconfig = string("profiles." + profname + ".config"); //profiles.name.section
+								profile.parent = profini.ReadString(sectionconfig, "parents", "$none"); //default "$none"
+								profile.ignore = profini.ReadBoolean(sectionconfig, "ignoreallmods", false);
+								profile.exclude = profini.ReadBoolean(sectionconfig, "excludeallmods", false);
+								profile.module = profini.ReadString(sectionconfig, "useifmodule", "");
+								auto linelower = string();
+								auto currentsection = int(0);
+								auto inisections = map<string, vector<string>>();
+								auto matchsection = regex(R"(^\s*\[\s*(.+?)\s*\].*)");
+								auto matchname = regex(R"(^profiles\.(.+?)\.(\w+))"); //profiles.name.section
+								auto matchkey = regex(R"(^\s*(.+?)\s*=\s*[+-]*0+[Xx\.]*0*)"); //key = 0
+								auto resultsection = smatch();
+								auto resultname = resultsection;
+								auto resultkey = resultsection;
+								profstream.clear(); profstream.seekg(profstart);
+								while (getline(profstream, linelower)) {
+									if (regex_match(linelower, resultsection, matchsection)) {
+										currentsection = 0;
+										auto resultstring = resultsection.str(1);
+										if (
+											regex_match(resultstring, resultname, matchname)
+											&& resultname.str(1) == profname
+											) {
+											auto matchstring = resultname.str(2);
+											if (matchstring == string("ignorefiles")) currentsection = 1; //corresponds to the case below
+											else if (matchstring == string("ignoremods")) currentsection = 2;
+											else if (matchstring == string("includemods")) currentsection = 3;
+											else if (matchstring == string("exclusivemods")) currentsection = 4;
+											else if (matchstring == string("priority")) currentsection = 5;
+											continue;
+										}
+									}
+									if (
+										currentsection != 0
+										&& linelower.length() > 0
+										) {
+										switch (currentsection) { //corresponds to the if-else-if above
+										case 1: profile.files.insert(linelower);
+											break;
+										case 2: profile.ignored.insert(linelower);
+											break;
+										case 3: profile.included.insert(linelower);
+											break;
+										case 4:	profile.exclusive.insert(linelower);
+											break;
+										case 5:
+											if (regex_match(linelower, resultkey, matchkey)) profile.ignored.insert(resultkey.str(1)); //if priority is 0, then add this mod to this profiles' list of ignored mods
+											break;
+										}
+									}
+								}
+							}
+							proffile.close();
+							mlprofs.push_back(profile);
+						}
+					};
+					auto defpath = folderml / fs::path("modloader.ini"); //read the file "modloader/modloader.ini" into an MLProfile
+					if (fs::exists(defpath)) readProfile(defpath);
+					else readProfile(folderml / fs::path(".data") / fs::path("modloader.ini.0")); //if the file above is not found, then read the file "modloader/.data/modloader.ini.0" into an MLProfile, since mod loader will copy it to the location of the above file anyway
+					auto profspath = folderml / fs::path(".profiles"); //read all the iles inside "modloader/.profiles/" into MLProfiles
+					if (fs::exists(profspath)) {
+						for (auto profitem : fs::directory_iterator(profspath)) readProfile(profitem);
+					}
+					auto exclusivemods = set<string>(); //a global set storing exclusive mods of all profiles except current
+					for (auto mlprof : mlprofs) {
+						if (mlprof.name != cmdline.profile) exclusivemods.merge(mlprof.exclusive);
+					}
+					auto findProfile = [](vector<MLProfile> profs, string name) { //finds an MLProfile given its name
+						for (auto prof : profs) {
+							if (prof.name == name) return prof;
+						}
+						return profs[0];
+					};
+					auto currentprof = findProfile(mlprofs, cmdline.profile); //get the current profile, named "default" if commandline did not have any
+					if (currentprof.ignore) filesml.clear(); //if [Profiles.Name.Config] -> IgnoreAllMods is true then return no files
+					else {
+						auto foldersml = set<string>(); //list of folders inside "modloader/" to scan
+						auto mlout = (casePath(folderml) / fs::path()).string();
+						if (cmdline.mods.size() > 0) foldersml = cmdline.mods; //if found one or more '-mod "mod"' inside commandline, then only scan these folders
+						else {
+							auto parentprof = currentprof; //begin inheritance of the current profile
+							while (parentprof.parent != "$none") { //stop inheritance if there aren't any more parents
+								parentprof = findProfile(mlprofs, parentprof.parent); //keep getting the parent of each gotten profile until one that doesn't have any
+								currentprof.files.merge(parentprof.files); //inherit [Profiles.Name.IgnoreFiles]
+								currentprof.ignored.merge(parentprof.ignored); //inherit [Profiles.Name.IgnoreMods]
+								currentprof.included.merge(parentprof.included); //inherit [Profiles.Name.IncludeMods]
+								for (auto exclusive : parentprof.exclusive) exclusivemods.erase(exclusive); //if the parent has any exclusive mods, then remove them from the global list of exclusive mods
+							}
+							for (auto modprof : mlprofs) { //inherit [Profiles.Name.Config] -> UseIfModule
+								if (modprof.module.length() > 0 && LoadedModule(modprof.module, "", false).isinstalled) {
+									parentprof = modprof;
+									do {
+										currentprof.files.merge(parentprof.files);
+										currentprof.ignored.merge(parentprof.ignored);
+										currentprof.included.merge(parentprof.included);
+										for (auto exclusive : parentprof.exclusive) exclusivemods.erase(exclusive);
+										parentprof = findProfile(mlprofs, parentprof.parent);
+									} while (parentprof.parent != "$none");
+									break; //only the first one found
+								}
+							}
+							currentprof.ignored.merge(exclusivemods); //make the current profile ignore all of the mods from the global list of exclusive mods
+
+							if (fs::exists(folderml)) { //create a list of all the folders inside "modloader/"
+								for (auto mlfolder : fs::directory_iterator(folderml)) {
+									auto folderpath = mlfolder.path();
+									if (
+										fs::is_directory(folderpath)
+										&& folderpath.stem().string()[0] != CHARML
+										) {
+										foldersml.insert(lowerString(OutputPath(folderpath, mlout, true)));
+									}
+								}
+							}
+
+							if (currentprof.exclude) foldersml = currentprof.included; //[Profiles.Name.Config] -> ExcludeAllMods is true, then set the list of folders to [Profiles.Name.IncludeMods]
+							for (auto mod : currentprof.ignored) foldersml.erase(mod); //remove all the mods in [Profiles.Name.IgnoreMods] from the list of folders
+						}
+
+						for (auto mlmod : foldersml) { //scan all the folders inside "modloader/" recursively and create a list of all the files
+							mlmod = (folderml / mlmod).string();
+							filesAll(mlmod, [](fs::path entrypath, fs::recursive_directory_iterator searchhandle) {
+								if (entrypath.stem().string()[0] == CHARML) {
+									if (fs::is_directory(entrypath)) {
+										searchhandle.disable_recursion_pending();
+									}
+								}
+								else {
+									filesml.insert(entrypath);
+								}
+							});
+						}
+
+						auto tempfiles = set<fs::path>();
+						
+						tempfiles = filesml; filesml.clear();
+						for (auto f : tempfiles) { //some optimization for the filtering to be done below
+							auto e = lowerString(f.extension().string());
+							if (
+								e == EXTENSIONAUID3
+								|| e == EXTENSIONIDE
+								|| e == EXTENSIONTXT
+								) filesml.insert(f);
+							else if (lowerString(f.filename().string()) == "gta.dat") filesgtadat.insert(f);
+						}
+
+						tempfiles = filesml; filesml.clear();
+						auto addFile = [&mlout](MLProfile *currentprof, fs::path mlfile) {
+							for (auto wildcard : currentprof->files) {
+								//"match_wildcard" taken from https://github.com/thelink2012/modloader/blob/18f85c2766d4e052a452c7b1d8f5860a6daac24b/src/core/wildcard.cpp#L20
+								if (match_wildcard(wildcard.c_str(), lowerString(OutputPath(mlfile, mlout, true)).c_str())) return;
+							}
+							filesml.insert(mlfile);
+						};
+						for (auto mlfile : tempfiles) addFile(&currentprof, mlfile); //filter the list of files based on [Profiles.Name.IgnoreFiles]
+
+						tempfiles = filesml; filesml.clear(); for (auto mlfile : tempfiles) filesml.insert(casePath(mlfile));
 					}
 				}
-				else {
-					filesml.push_back(entrypath);
-				}
-			});
-
-			{
-				//filter 'filesml' by replicating Mod Loader behaviour
-				//ignore files and folders beginning with a '.' (dot): DONE
-
 			}
 
 			for (auto filepath : filesml) {
 				auto fileextension = lowerString(filepath.extension().string());
-				if (fileextension == EXTENSIONAUID3) filesauid3.push_back(filepath);
-				else if (fileextension == EXTENSIONIDE) fileside.push_back(filepath);
-				else if (fileextension == EXTENSIONTXT && fs::file_size(filepath) < 61440) filestxt.push_back(filepath);
+				if (fileextension == EXTENSIONAUID3) filesauid3.insert(filepath);
+				else if (fileextension == EXTENSIONIDE) fileside.insert(filepath);
+				else if (fileextension == EXTENSIONTXT && fs::file_size(filepath) < 61440) filestxt.insert(filepath);
+				else if (lowerString(filepath.filename().string()) == "gta.dat") filesgtadat.insert(filepath);
 			}
 		}
 
 		if (filesauid3.size() > 0) {
+			for (auto t : filestxt) filesgtadat.insert(lowerString(t.filename().string()));
+			filesgtadat.insert(filestxt.begin(), filestxt.end()); //create a list of all level lines
+			auto gtadatline = string();
+			auto idelines = set<fs::path>({
+				//always read
+				"data/peds.ide",
+				"data/vehicles.ide",
+				"data/veh_mods.ide"
+			});
+			for (auto txtpath: filesgtadat) {
+				auto txtfile = fstream(); txtfile.open(txtpath);
+				if (txtfile.is_open()) {
+					while (getline(txtfile, gtadatline)) {
+						auto linelower = lowerString(gtadatline);
+						if (linelower.substr(0, 4) == "ide ") {
+							idelines.insert(fs::path(linelower.substr(5)).filename());
+						}
+					}
+					txtfile.close();
+				}
+			}
+			auto readDat = [&idelines](fs::path datstem, fs::path datfolder = folderdata) {
+				auto datfile = fstream();
+				datfile.open(datfolder / datstem.replace_extension(EXTENSIONDAT));
+				if (datfile.is_open()) {
+					auto datline = string();
+					while (getline(datfile, datline)) {
+						auto linelower = lowerString(datline);
+						if (
+							datline.length() > 4
+							&& linelower.substr(0, 4) == "ide "
+							) {
+							auto idepath = folderroot / fs::path(datline.substr(4));
+							fileside.insert(idepath);
+							idelines.insert(fs::path(linelower).filename());
+						}
+					}
+					datfile.close();
+				}
+			};
+			readDat("default");
+			readDat("gta");
+			auto tempfiles = fileside; fileside.clear(); //remove ide files that don't have a level line
+			for (auto idepath : tempfiles) {
+				if (idelines.find(lowerString(idepath.filename().string())) != idelines.end()) fileside.insert(idepath);
+				else logignored.writeText("Ignored IDE file " + OutputPath(idepath) + " because of missing level line.");
+			}
+
 			auto deleteGenerated = []() {
 				for (auto filepath : filesauid3) {
 					fs::remove(filepath.replace_extension(EXTENSIONIDE));
@@ -1224,19 +1541,8 @@ public:
 			deleteGenerated();
 			Events::shutdownRwEvent += deleteGenerated;
 
-			auto removeDeleted = [](vector<fs::path> *filepaths) {
-				filepaths->erase(
-					remove_if(
-						filepaths->begin(), filepaths->end(),
-						[](fs::path filepath) {
-					if (!fs::exists(filepath)) return true;
-					return false;
-				}
-					), filepaths->end()
-					);
-			};
-			removeDeleted(&fileside);
-			removeDeleted(&filestxt);
+			for (auto f : fileside) { if (!fs::exists(f)) fileside.erase(f); }
+			for (auto f : filestxt) { if (!fs::exists(f)) filestxt.erase(f); }
 
 			#define LOGEXTENSION "AUID3"
 			#define LOGFILES filesauid3
